@@ -1,0 +1,373 @@
+import logging
+from math import ceil
+
+from werkzeug.exceptions import BadRequest
+
+from odoo import http
+from odoo.exceptions import AccessError, MissingError, UserError, ValidationError
+from odoo.http import request
+from odoo.osv import expression
+
+_logger = logging.getLogger(__name__)
+
+
+class ApiResponseMixin:
+    def _json_response(self, success, message, data=None, meta=None, status=200, errors=None):
+        payload = {
+            "success": success,
+            "message": message,
+            "status": status,
+        }
+        if data is not None:
+            payload["data"] = data
+        if meta is not None:
+            payload["meta"] = meta
+        if errors is not None:
+            payload["errors"] = errors
+        return payload
+
+    def _success(self, message, data=None, meta=None, status=200):
+        return self._json_response(True, message, data=data, meta=meta, status=status)
+
+    def _error(self, message, status=400, errors=None):
+        return self._json_response(False, message, status=status, errors=errors)
+
+    def _handle_exception(self, exc):
+        if isinstance(exc, BadRequest):
+            return self._error(str(exc.description), status=400)
+        if isinstance(exc, MissingError):
+            return self._error("Record not found.", status=404)
+        if isinstance(exc, AccessError):
+            return self._error("You do not have permission to perform this action.", status=403)
+        if isinstance(exc, (ValidationError, UserError)):
+            return self._error(str(exc), status=422)
+
+        _logger.exception("Unexpected API error")
+        return self._error("An unexpected server error occurred.", status=500)
+
+
+class ProductApiController(http.Controller, ApiResponseMixin):
+    _allowed_write_fields = {
+        "name",
+        "default_code",
+        "barcode",
+        "list_price",
+        "standard_price",
+        "type",
+        "categ_id",
+        "active",
+        "sale_ok",
+        "purchase_ok",
+        "description_sale",
+        "description_purchase",
+        "weight",
+        "volume",
+    }
+
+    def _get_product_model(self):
+        return request.env["product.product"].sudo()
+
+    def _parse_int_param(self, name, default, minimum=None, maximum=None):
+        raw_value = request.params.get(name, default)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"Invalid '{name}' value. Expected an integer.") from exc
+
+        if minimum is not None and value < minimum:
+            raise BadRequest(f"'{name}' must be greater than or equal to {minimum}.")
+        if maximum is not None and value > maximum:
+            raise BadRequest(f"'{name}' must be less than or equal to {maximum}.")
+        return value
+
+    def _parse_payload(self):
+        payload = request.params or {}
+        if not isinstance(payload, dict):
+            raise BadRequest("Request body must be a JSON object.")
+        return payload
+
+    def _parse_bool_param(self, name):
+        raw_value = request.params.get(name)
+        if raw_value is None:
+            return None
+
+        normalized = str(raw_value).strip().lower()
+        if normalized not in {"true", "false", "1", "0"}:
+            raise BadRequest(f"Invalid '{name}' value. Use true or false.")
+        return normalized in {"true", "1"}
+
+    def _parse_optional_int_param(self, name, minimum=None):
+        raw_value = request.params.get(name)
+        if raw_value in (None, ""):
+            return None
+
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise BadRequest(f"Invalid '{name}' value. Expected an integer.") from exc
+
+        if minimum is not None and value < minimum:
+            raise BadRequest(f"'{name}' must be greater than or equal to {minimum}.")
+        return value
+
+    def _prepare_write_values(self, payload, partial=False):
+        unknown_fields = sorted(set(payload) - self._allowed_write_fields)
+        if unknown_fields:
+            raise BadRequest(
+                "Unsupported fields in payload: %s." % ", ".join(unknown_fields)
+            )
+
+        if not partial and "name" not in payload:
+            raise BadRequest("Missing required field: name.")
+
+        values = {}
+        for field_name, field_value in payload.items():
+            if field_name == "categ_id":
+                if field_value in (None, False):
+                    raise BadRequest("Field 'categ_id' cannot be empty.")
+                try:
+                    category_id = int(field_value)
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest("Field 'categ_id' must be an integer.") from exc
+                category = request.env["product.category"].sudo().browse(category_id).exists()
+                if not category:
+                    raise BadRequest("Invalid 'categ_id'. Category not found.")
+                values[field_name] = category_id
+                continue
+
+            values[field_name] = field_value
+
+        return values
+
+    def _serialize_product(self, product):
+        return {
+            "id": product.id,
+            "name": product.name,
+            "default_code": product.default_code,
+            "barcode": product.barcode,
+            "list_price": product.list_price,
+            "standard_price": product.standard_price,
+            "type": product.type,
+            "active": product.active,
+            "sale_ok": product.sale_ok,
+            "purchase_ok": product.purchase_ok,
+            "categ_id": product.categ_id.id,
+            "categ_name": product.categ_id.display_name,
+            "uom_id": product.uom_id.id,
+            "uom_name": product.uom_id.display_name,
+            "description_sale": product.description_sale,
+            "description_purchase": product.description_purchase,
+            "weight": product.weight,
+            "volume": product.volume,
+            "create_date": product.create_date.isoformat() if product.create_date else None,
+            "write_date": product.write_date.isoformat() if product.write_date else None,
+        }
+
+    def _build_search_domain(self, search_term):
+        domain = []
+        if search_term:
+            domain = expression.OR([
+                [("name", "ilike", search_term)],
+                [("default_code", "ilike", search_term)],
+                [("barcode", "ilike", search_term)],
+            ])
+
+        active_filter = self._parse_bool_param("active")
+        if active_filter is not None:
+            domain = expression.AND([domain, [("active", "=", active_filter)]])
+
+        return domain, active_filter
+
+    def _build_product_search_domain(self):
+        name = (request.params.get("name") or "").strip()
+        if not name:
+            raise BadRequest("Field 'name' is required for product search.")
+
+        exact_match = self._parse_bool_param("exact_match")
+        operator = "=" if exact_match else "ilike"
+        domain = [[("name", operator, name)]]
+
+        default_code = (request.params.get("default_code") or "").strip()
+        if default_code:
+            domain.append([("default_code", "ilike", default_code)])
+
+        barcode = (request.params.get("barcode") or "").strip()
+        if barcode:
+            domain.append([("barcode", "ilike", barcode)])
+
+        product_type = (request.params.get("type") or "").strip()
+        if product_type:
+            domain.append([("type", "=", product_type)])
+
+        categ_id = self._parse_optional_int_param("categ_id", minimum=1)
+        if categ_id is not None:
+            category = request.env["product.category"].sudo().browse(categ_id).exists()
+            if not category:
+                raise BadRequest("Invalid 'categ_id'. Category not found.")
+            domain.append([("categ_id", "=", categ_id)])
+
+        for field_name in ("active", "sale_ok", "purchase_ok"):
+            field_value = self._parse_bool_param(field_name)
+            if field_value is not None:
+                domain.append([(field_name, "=", field_value)])
+
+        return expression.AND(domain), name
+
+    @http.route(
+        "/api/v1/products/list",
+        auth="public",
+        type="json",
+        methods=["POST"],
+        csrf=False,
+        readonly=True,
+    )
+    def list_products(self, **kwargs):
+        try:
+            page = self._parse_int_param("page", 1, minimum=1)
+            page_size = self._parse_int_param("page_size", 20, minimum=1, maximum=100)
+            search_term = (request.params.get("search") or "").strip()
+            domain, active_filter = self._build_search_domain(search_term)
+
+            product_model = self._get_product_model()
+            if active_filter is False:
+                product_model = product_model.with_context(active_test=False)
+            total = product_model.search_count(domain)
+            offset = (page - 1) * page_size
+            products = product_model.search(domain, offset=offset, limit=page_size, order="id desc")
+
+            meta = {
+                "page": page,
+                "page_size": page_size,
+                "total_records": total,
+                "total_pages": ceil(total / page_size) if total else 0,
+                "has_next": offset + page_size < total,
+                "has_previous": page > 1,
+                "search": search_term or None,
+            }
+            data = [self._serialize_product(product) for product in products]
+            return self._success("Products fetched successfully.", data=data, meta=meta)
+        except Exception as exc:
+            return self._handle_exception(exc)
+
+    @http.route(
+        "/api/v1/products/search",
+        auth="public",
+        type="json",
+        methods=["POST"],
+        csrf=False,
+        readonly=True,
+    )
+    def search_products(self, **kwargs):
+        try:
+            page = self._parse_int_param("page", 1, minimum=1)
+            page_size = self._parse_int_param("page_size", 20, minimum=1, maximum=100)
+            domain, name = self._build_product_search_domain()
+
+            product_model = self._get_product_model()
+            if self._parse_bool_param("active") is False:
+                product_model = product_model.with_context(active_test=False)
+
+            total = product_model.search_count(domain)
+            offset = (page - 1) * page_size
+            products = product_model.search(domain, offset=offset, limit=page_size, order="id desc")
+
+            meta = {
+                "page": page,
+                "page_size": page_size,
+                "total_records": total,
+                "total_pages": ceil(total / page_size) if total else 0,
+                "has_next": offset + page_size < total,
+                "has_previous": page > 1,
+                "filters": {
+                    "name": name,
+                    "default_code": (request.params.get("default_code") or None),
+                    "barcode": (request.params.get("barcode") or None),
+                    "type": (request.params.get("type") or None),
+                    "categ_id": self._parse_optional_int_param("categ_id", minimum=1),
+                    "active": self._parse_bool_param("active"),
+                    "sale_ok": self._parse_bool_param("sale_ok"),
+                    "purchase_ok": self._parse_bool_param("purchase_ok"),
+                    "exact_match": self._parse_bool_param("exact_match") or False,
+                },
+            }
+            data = [self._serialize_product(product) for product in products]
+            return self._success("Products searched successfully.", data=data, meta=meta)
+        except Exception as exc:
+            return self._handle_exception(exc)
+
+    @http.route(
+        "/api/v1/products/get/<int:product_id>",
+        auth="public",
+        type="json",
+        methods=["POST"],
+        csrf=False,
+        readonly=True,
+    )
+    def get_product(self, product_id, **kwargs):
+        try:
+            product = self._get_product_model().with_context(active_test=False).browse(product_id).exists()
+            if not product:
+                raise MissingError("Product not found.")
+            return self._success("Product fetched successfully.", data=self._serialize_product(product))
+        except Exception as exc:
+            return self._handle_exception(exc)
+
+    @http.route(
+        "/api/v1/products/create",
+        auth="public",
+        type="json",
+        methods=["POST"],
+        csrf=False,
+    )
+    def create_product(self, **kwargs):
+        try:
+            values = self._prepare_write_values(self._parse_payload(), partial=False)
+            product = self._get_product_model().create(values)
+            return self._success(
+                "Product created successfully.",
+                data=self._serialize_product(product),
+                status=201,
+            )
+        except Exception as exc:
+            return self._handle_exception(exc)
+
+    @http.route(
+        "/api/v1/products/update/<int:product_id>",
+        auth="public",
+        type="json",
+        methods=["POST"],
+        csrf=False,
+    )
+    def update_product(self, product_id, **kwargs):
+        try:
+            payload = self._parse_payload()
+            if not payload:
+                raise BadRequest("Request body cannot be empty.")
+
+            product = self._get_product_model().with_context(active_test=False).browse(product_id).exists()
+            if not product:
+                raise MissingError("Product not found.")
+
+            values = self._prepare_write_values(payload, partial=True)
+            product.write(values)
+            return self._success("Product updated successfully.", data=self._serialize_product(product))
+        except Exception as exc:
+            return self._handle_exception(exc)
+
+    @http.route(
+        "/api/v1/products/delete/<int:product_id>",
+        auth="public",
+        type="json",
+        methods=["POST"],
+        csrf=False,
+    )
+    def delete_product(self, product_id, **kwargs):
+        try:
+            product = self._get_product_model().with_context(active_test=False).browse(product_id).exists()
+            if not product:
+                raise MissingError("Product not found.")
+
+            product.unlink()
+            return self._success("Product deleted successfully.", data={"id": product_id})
+        except Exception as exc:
+            return self._handle_exception(exc)
