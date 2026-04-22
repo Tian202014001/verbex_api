@@ -5,7 +5,7 @@
     "category": "Tools",
     "author": "Verbex",
     "license": "LGPL-3",
-    "depends": ["product"],
+    "depends": ["product", "sale_management"],
     "data": [],
     "installable": True,
     "application": False,
