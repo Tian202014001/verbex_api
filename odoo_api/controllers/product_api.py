@@ -81,7 +81,7 @@ class ProductApiController(BaseApiController):
             "write_date": product.write_date.isoformat() if product.write_date else None,
         }
 
-    def _build_search_domain(self, search_term):
+    def _build_search_domain(self, search_term, params=None):
         domain = []
         if search_term:
             domain = expression.OR([
@@ -90,34 +90,35 @@ class ProductApiController(BaseApiController):
                 [("barcode", "ilike", search_term)],
             ])
 
-        active_filter = self._parse_bool_param("active")
+        active_filter = self._parse_bool_param("active", params=params)
         if active_filter is not None:
             domain = expression.AND([domain, [("active", "=", active_filter)]])
 
         return domain, active_filter
 
-    def _build_product_search_domain(self):
-        name = (request.params.get("name") or "").strip()
+    def _build_product_search_domain(self, params=None):
+        params = params if params is not None else request.params
+        name = (params.get("name") or "").strip()
         if not name:
             raise BadRequest("Field 'name' is required for product search.")
 
-        exact_match = self._parse_bool_param("exact_match")
+        exact_match = self._parse_bool_param("exact_match", params=params)
         operator = "=" if exact_match else "ilike"
         domain = [[("name", operator, name)]]
 
-        default_code = (request.params.get("default_code") or "").strip()
+        default_code = (params.get("default_code") or "").strip()
         if default_code:
             domain.append([("default_code", "ilike", default_code)])
 
-        barcode = (request.params.get("barcode") or "").strip()
+        barcode = (params.get("barcode") or "").strip()
         if barcode:
             domain.append([("barcode", "ilike", barcode)])
 
-        product_type = (request.params.get("type") or "").strip()
+        product_type = (params.get("type") or "").strip()
         if product_type:
             domain.append([("type", "=", product_type)])
 
-        categ_id = self._parse_optional_int_param("categ_id", minimum=1)
+        categ_id = self._parse_optional_int_param("categ_id", minimum=1, params=params)
         if categ_id is not None:
             category = request.env["product.category"].sudo().browse(categ_id).exists()
             if not category:
@@ -125,11 +126,54 @@ class ProductApiController(BaseApiController):
             domain.append([("categ_id", "=", categ_id)])
 
         for field_name in ("active", "sale_ok", "purchase_ok"):
-            field_value = self._parse_bool_param(field_name)
+            field_value = self._parse_bool_param(field_name, params=params)
             if field_value is not None:
                 domain.append([(field_name, "=", field_value)])
 
         return expression.AND(domain), name
+
+    def _parse_http_json_payload(self):
+        payload = request.httprequest.get_json(silent=True)
+        if payload is None:
+            payload = request.params or {}
+        if not isinstance(payload, dict):
+            raise BadRequest("Request body must be a JSON object.")
+        return payload
+
+    def _search_products_from_params(self, params):
+        page = self._parse_int_param("page", 1, minimum=1, params=params)
+        page_size = self._parse_int_param("page_size", 20, minimum=1, maximum=100, params=params)
+        domain, name = self._build_product_search_domain(params=params)
+
+        product_model = self._get_product_model()
+        if self._parse_bool_param("active", params=params) is False:
+            product_model = product_model.with_context(active_test=False)
+
+        total = product_model.search_count(domain)
+        offset = (page - 1) * page_size
+        products = product_model.search(domain, offset=offset, limit=page_size, order="id desc")
+
+        meta = {
+            "page": page,
+            "page_size": page_size,
+            "total_records": total,
+            "total_pages": ceil(total / page_size) if total else 0,
+            "has_next": offset + page_size < total,
+            "has_previous": page > 1,
+            "filters": {
+                "name": name,
+                "default_code": (params.get("default_code") or None),
+                "barcode": (params.get("barcode") or None),
+                "type": (params.get("type") or None),
+                "categ_id": self._parse_optional_int_param("categ_id", minimum=1, params=params),
+                "active": self._parse_bool_param("active", params=params),
+                "sale_ok": self._parse_bool_param("sale_ok", params=params),
+                "purchase_ok": self._parse_bool_param("purchase_ok", params=params),
+                "exact_match": self._parse_bool_param("exact_match", params=params) or False,
+            },
+        }
+        data = [self._serialize_product(product) for product in products]
+        return self._success("Products searched successfully.", data=data, meta=meta)
 
     @http.route(
         "/api/v1/products/list",
@@ -177,41 +221,25 @@ class ProductApiController(BaseApiController):
     )
     def search_products(self, **kwargs):
         try:
-            page = self._parse_int_param("page", 1, minimum=1)
-            page_size = self._parse_int_param("page_size", 20, minimum=1, maximum=100)
-            domain, name = self._build_product_search_domain()
-
-            product_model = self._get_product_model()
-            if self._parse_bool_param("active") is False:
-                product_model = product_model.with_context(active_test=False)
-
-            total = product_model.search_count(domain)
-            offset = (page - 1) * page_size
-            products = product_model.search(domain, offset=offset, limit=page_size, order="id desc")
-
-            meta = {
-                "page": page,
-                "page_size": page_size,
-                "total_records": total,
-                "total_pages": ceil(total / page_size) if total else 0,
-                "has_next": offset + page_size < total,
-                "has_previous": page > 1,
-                "filters": {
-                    "name": name,
-                    "default_code": (request.params.get("default_code") or None),
-                    "barcode": (request.params.get("barcode") or None),
-                    "type": (request.params.get("type") or None),
-                    "categ_id": self._parse_optional_int_param("categ_id", minimum=1),
-                    "active": self._parse_bool_param("active"),
-                    "sale_ok": self._parse_bool_param("sale_ok"),
-                    "purchase_ok": self._parse_bool_param("purchase_ok"),
-                    "exact_match": self._parse_bool_param("exact_match") or False,
-                },
-            }
-            data = [self._serialize_product(product) for product in products]
-            return self._success("Products searched successfully.", data=data, meta=meta)
+            return self._search_products_from_params(request.params)
         except Exception as exc:
             return self._handle_exception(exc)
+
+    @http.route(
+        "/api/v1/products/search/flat",
+        auth="public",
+        type="http",
+        methods=["POST"],
+        csrf=False,
+        readonly=True,
+    )
+    def search_products_flat(self, **kwargs):
+        try:
+            result = self._search_products_from_params(self._parse_http_json_payload())
+            return request.make_json_response(result, status=result["status"])
+        except Exception as exc:
+            error = self._handle_exception(exc)
+            return request.make_json_response(error, status=error["status"])
 
     @http.route(
         "/api/v1/products/get/<int:product_id>",

@@ -51,8 +51,9 @@ class BaseApiController(http.Controller, ApiResponseMixin):
     def _get_sale_order_model(self):
         return request.env["sale.order"].sudo()
 
-    def _parse_int_param(self, name, default, minimum=None, maximum=None):
-        raw_value = request.params.get(name, default)
+    def _parse_int_param(self, name, default, minimum=None, maximum=None, params=None):
+        params = params if params is not None else request.params
+        raw_value = params.get(name, default)
         try:
             value = int(raw_value)
         except (TypeError, ValueError) as exc:
@@ -70,8 +71,9 @@ class BaseApiController(http.Controller, ApiResponseMixin):
             raise BadRequest("Request body must be a JSON object.")
         return payload
 
-    def _parse_bool_param(self, name):
-        raw_value = request.params.get(name)
+    def _parse_bool_param(self, name, params=None):
+        params = params if params is not None else request.params
+        raw_value = params.get(name)
         if raw_value is None:
             return None
 
@@ -80,8 +82,9 @@ class BaseApiController(http.Controller, ApiResponseMixin):
             raise BadRequest(f"Invalid '{name}' value. Use true or false.")
         return normalized in {"true", "1"}
 
-    def _parse_optional_int_param(self, name, minimum=None):
-        raw_value = request.params.get(name)
+    def _parse_optional_int_param(self, name, minimum=None, params=None):
+        params = params if params is not None else request.params
+        raw_value = params.get(name)
         if raw_value in (None, ""):
             return None
 
